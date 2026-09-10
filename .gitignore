@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+*.egg-info/
+.venv/
+venv/
+# 真实经营数据绝不入库（只允许 examples/ 下的模拟数据）
+*.xlsx
+*.xls
+!examples/**/*.xlsx
+真实数据/
+报告/
+
+# 端到端演示的产物（每次运行都会重新生成）
+examples/out/
