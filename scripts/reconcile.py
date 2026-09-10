@@ -482,10 +482,59 @@ def _looks_like_date_column(name: str, rows: Sequence[Any], idx: int) -> bool:
     return hit * 2 >= len(values[:200])
 
 
-def _auto_numeric_cols(t: Any, rows: Sequence[Any], exclude: Sequence[int] = ()) -> List[str]:
+# 列名像 ID / 编号 / 券码 —— 这类列即使全是数字也**绝不是金额**。
+# 不排除它们会造成真实的错误结论：把券码求和会得到 9 亿亿这种数字，
+# 报告里就会出现"券码 放大 1.15 倍 → 是（放大）"这种无意义判定。
+_ID_LIKE_NAME_RE = re.compile(
+    r"(^|[^a-z])(id|ids)($|[^a-z])"
+    r"|编号|单号|订单号|券码|核销码|条码|编码|序号|账号|手机|电话"
+    r"|门店号|计划号|素材号|商品号|用户号|号$",
+    re.IGNORECASE,
+)
+# 取值形态：全为长纯数字（>=10 位）且几乎都唯一 → 典型的 ID，不是金额
+_ID_LIKE_MIN_DIGITS = 10
+_ID_LIKE_UNIQUE_RATIO = Decimal("0.8")
+# 唯一性比例在样本太少时没有意义：只有 1~2 行时任何取值都是"唯一"的，
+# 那样会把一个真实的金额列误判成 ID，反而让放大检测失效。
+_ID_LIKE_MIN_VALUES = 3
+
+
+def _looks_like_id_column(name: str, rows: Sequence[Any], idx: int) -> bool:
+    """判断一列是否是 ID/编号类（不应当作金额列参与合计与放大检测）。
+
+    注意这是"宁可不报也不误报"的取舍：**漏掉一个真实金额列**会让放大检测失效，
+    **误把 ID 当金额**只会产生噪音。所以只在两个信号都很强时才排除：
+      1. 列名命中 ID/编号/券码 等词；或
+      2. 取值全为 >=10 位纯数字，且去重比例 >= 0.8（金额极少长成这样）。
+    """
+    if _ID_LIKE_NAME_RE.search(name or ""):
+        return True
+    values = []
+    for row in rows:
+        v = _cell(row, idx).strip()
+        if v:
+            values.append(v)
+    if not values:
+        return False
+    if len(values) < _ID_LIKE_MIN_VALUES:
+        # 样本太少时"唯一性"不可判定：宁可留着也不会让放大检测失效
+        return False
+    digits = [v for v in values if v.isdigit()]
+    if len(digits) != len(values):
+        return False
+    if any(len(v) < _ID_LIKE_MIN_DIGITS for v in digits):
+        return False
+    ratio = Decimal(len(set(values))) / Decimal(len(values))
+    return ratio >= _ID_LIKE_UNIQUE_RATIO
+
+
+def _auto_numeric_cols(t: Any, rows: Sequence[Any], exclude: Sequence[int] = (),
+                       skipped_out: Optional[List[str]] = None) -> List[str]:
     """启发式挑出"金额/数量"类数值列（占比 >= 60% 且至少 1 个可解析值）。
 
-    会排除键列、日期/时间列（``20240501`` 能被解析成数字，但绝不是金额）。
+    会排除键列、日期/时间列（``20240501`` 能被解析成数字，但绝不是金额），
+    以及 ID/编号/券码类列（见 :func:`_looks_like_id_column`）。
+    被排除的列名会追加到 ``skipped_out``，**必须在报告里说明**，不能静默丢列。
     """
     out: List[str] = []
     headers = _headers(t)
@@ -493,6 +542,10 @@ def _auto_numeric_cols(t: Any, rows: Sequence[Any], exclude: Sequence[int] = ())
         if idx in exclude:
             continue
         if _looks_like_date_column(h, rows, idx):
+            continue
+        if _looks_like_id_column(h, rows, idx):
+            if skipped_out is not None:
+                skipped_out.append(h)
             continue
         st = _column_stats(rows, idx)
         if st["parsed"] >= 1 and st["numeric_ratio"] >= Decimal("0.6"):
@@ -714,15 +767,24 @@ def join_audit(
     l_lookup = OrderedDict((k, c) for k, c in l_mult.items() if k != "")
     r_lookup = OrderedDict((k, c) for k, c in r_mult.items() if k != "")
 
+    left_skipped: List[str] = []
+    right_skipped: List[str] = []
     left_cols = list(left_value_cols) if left_value_cols else _auto_numeric_cols(
-        left, left_rows, exclude=(li,)
+        left, left_rows, exclude=(li,), skipped_out=left_skipped
     )
     left_cols_auto = not left_value_cols
     right_cols = list(right_value_cols) if right_value_cols else _auto_numeric_cols(
-        right, right_rows, exclude=(ri,)
+        right, right_rows, exclude=(ri,), skipped_out=right_skipped
     )
     right_cols_auto = not right_value_cols
     notes: List[str] = []
+    for tbl, skipped in ((left, left_skipped), (right, right_skipped)):
+        if skipped:
+            notes.append(
+                "表《%s》的列 %s 疑似 ID/编号/券码，**已排除出金额列**（把 ID 求和会产生无意义数字）。"
+                "若其中确有金额列，请用 --left-values/--right-values 显式指定。"
+                % (_table_name(tbl), "、".join(skipped))
+            )
     if left_cols_auto and left_cols:
         notes.append(
             "左表金额列未指定，已自动识别为：%s（若语义不符请用 --left-values 显式指定）"

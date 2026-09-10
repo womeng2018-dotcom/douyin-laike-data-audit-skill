@@ -590,6 +590,89 @@ class TestCohortPipeline(unittest.TestCase):
         self.assertIn("--event-time", err)
 
 
+class TestMoneyColumnDetection(unittest.TestCase):
+    """
+    回归测试：ID/编号/券码列**绝不能被当成金额列**。
+    不修这个 bug，报告里会出现"券码 91,016,044,814,680,135.00 放大 1.15 倍 → 是（放大）"
+    这种无意义判定，并淹没真正的金额放大信号。
+    """
+
+    class _T(object):
+        def __init__(self, headers, rows):
+            self.headers, self.rows = headers, rows
+            self.name, self.sheet, self.source = "mem", None, "mem"
+
+        @property
+        def n_rows(self):
+            return len(self.rows)
+
+        @property
+        def n_cols(self):
+            return len(self.headers)
+
+    def setUp(self):
+        if R is None:
+            self.skipTest("reconcile.py 不可用")
+
+    def test_id_named_columns_are_excluded(self):
+        t = self._T(["券码", "商品ID", "订单实收金额", "购买数量"],
+                    [["7001234567890001", "12345", "200.00", "2"],
+                     ["7001234567890002", "12345", "200.00", "2"],
+                     ["7001234567890003", "67890", "100.00", "1"]])
+        skipped = []
+        cols = R._auto_numeric_cols(t, t.rows, skipped_out=skipped)
+        self.assertNotIn("券码", cols)
+        self.assertNotIn("商品ID", cols)
+        self.assertIn("订单实收金额", cols)
+        self.assertIn("购买数量", cols)
+        self.assertIn("券码", skipped)
+        self.assertIn("商品ID", skipped)
+
+    def test_long_unique_digits_excluded_even_with_plain_name(self):
+        """列名不带 ID 字样，但取值是 16 位唯一纯数字 → 仍按 ID 排除。"""
+        t = self._T(["卡号", "金额"],
+                    [["9000000000000001", "10.00"],
+                     ["9000000000000002", "20.00"],
+                     ["9000000000000003", "30.00"]])
+        cols = R._auto_numeric_cols(t, t.rows)
+        self.assertNotIn("卡号", cols)
+        self.assertIn("金额", cols)
+
+    def test_short_money_values_are_not_mistaken_for_ids(self):
+        """6 位以内的正常金额不能被误排除。"""
+        t = self._T(["金额"], [["100000.00"], ["200000.00"], ["300000.00"]])
+        self.assertIn("金额", R._auto_numeric_cols(t, t.rows))
+
+    def test_repeated_long_digits_not_excluded_as_id(self):
+        """长数字但大量重复（无唯一性特征）→ 不排除。"""
+        t = self._T(["金额"], [["1000000000"] for _ in range(10)])
+        self.assertIn("金额", R._auto_numeric_cols(t, t.rows))
+
+    def test_single_row_long_number_is_not_treated_as_id(self):
+        """只有 1 行时"唯一性"不可判定，不能因此把一个真实金额列排除掉
+        —— 误排除会让放大检测失效，比留下噪音更危险。"""
+        t = self._T(["金额"], [["1000000000"]])
+        self.assertIn("金额", R._auto_numeric_cols(t, t.rows))
+        t2 = self._T(["金额"], [["1000000000"], ["2000000000"]])
+        self.assertIn("金额", R._auto_numeric_cols(t2, t2.rows))
+
+    def test_join_report_mentions_exclusions(self):
+        """排除必须写进报告备注，不能静默丢列。"""
+        d = tempfile.mkdtemp()
+        left = os.path.join(d, "l.csv")
+        right = os.path.join(d, "r.csv")
+        with open(left, "w", encoding="utf-8-sig") as fh:
+            fh.write("订单ID,券码,订单实收金额\nO1,7001234567890001,200\n")
+        with open(right, "w", encoding="utf-8-sig") as fh:
+            fh.write("订单ID,券码,核销金额\nO1,7001234567890001,100\n")
+        rc, out, err = _run(["scripts/reconcile.py", "join", "--left", left,
+                             "--right", right, "--left-key", "订单ID",
+                             "--right-key", "订单ID"], expect_zero=False)
+        blob = out + err
+        self.assertIn("已排除出金额列", blob)
+        self.assertIn("券码", blob)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, argv=[sys.argv[0]] + [a for a in sys.argv[1:]
                                                      if not a.startswith("--strict")])
